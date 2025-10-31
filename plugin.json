@@ -1,0 +1,16 @@
+{
+  "id": "shazomi",
+  "name": "shazomi",
+  "author": "Anvay Vats",
+  "description": "Real-time song identification from audio captured by your Omi device. Automatically detects and notifies you of songs playing around you.",
+  "image": "/plugins/logos/shazomi.png",
+  "capabilities": [
+    "external_integration"
+  ],
+  "external_integration": {
+    "triggers_on": "audio_bytes",
+    "webhook_url": "https://your-domain.com/audio-stream",
+    "setup_completed_url": "https://your-domain.com/setup-completed"
+  },
+  "deleted": false
+}
