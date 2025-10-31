@@ -15,17 +15,35 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
+from logging.handlers import RotatingFileHandler
 
 # Import our fingerprinting modules
 from fingerprinting import fingerprint_audio, best_match
 from supabase_storage import get_matches, get_info_for_song_id
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Configure persistent logging to file + console
+os.makedirs('logs', exist_ok=True)
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# File handler with rotation (10MB max, keep 5 backups)
+file_handler = RotatingFileHandler(
+    'logs/shazomi.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
 )
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+# Configure root logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # Environment variables
 OMI_APP_ID = os.getenv("OMI_APP_ID")
@@ -139,7 +157,7 @@ async def process_audio_buffer(uid: str, sample_rate: int):
 
     if not matches:
         logger.info(f"User {uid}: No matches found")
-        await send_notification(uid, "🎵 Song not in database")
+        await send_notification(uid, "🎵 Hmm, I don't recognize this song. Make sure it's in your database!")
         return
 
     # Get best match
@@ -147,7 +165,7 @@ async def process_audio_buffer(uid: str, sample_rate: int):
 
     if not song_id or score < MIN_MATCH_SCORE:
         logger.info(f"User {uid}: Match score too low ({score})")
-        await send_notification(uid, "🎵 No confident match found")
+        await send_notification(uid, "🎵 I heard something, but couldn't match it confidently. Try again with clearer audio!")
         return
 
     # Get song info
@@ -165,14 +183,16 @@ async def process_audio_buffer(uid: str, sample_rate: int):
         # Add to identified songs
         identified_songs[uid].add(song_key)
 
-        # Format and send notification
+        # Format and send conversational notification
         now = datetime.now()
-        message = f"🎵 {title} by {artist} (score: {score}) at {now.strftime('%I:%M %p')}"
+        confidence = "🔥" if score >= 50 else "✨" if score >= 30 else "👍"
+        message = f"🎵 That's \"{title}\" by {artist}! {confidence} (Match: {score})"
 
         await send_notification(uid, message)
         logger.info(f"User {uid}: Identified {title} - {artist} (score: {score})")
     else:
         logger.warning(f"User {uid}: Song ID {song_id} not found in database")
+        await send_notification(uid, "🎵 Found a match but couldn't retrieve song info. Database might need updating!")
 
 
 @app.post("/audio-stream")
@@ -277,6 +297,44 @@ async def stats(uid: str = Query(None, description="Optional user ID for user-sp
         "total_songs_identified": sum(len(songs) for songs in identified_songs.values()),
         "users_with_audio": [uid for uid, buf in audio_buffers.items() if len(buf) > 0]
     }
+
+
+@app.post("/test-notification")
+async def test_notification(uid: str = Query(..., description="User ID to send test notification")):
+    """
+    Test endpoint to manually trigger a notification
+
+    Args:
+        uid: User ID to send the test notification to
+
+    Returns:
+        Success/failure status
+    """
+    logger.info(f"Test notification requested for user {uid}")
+
+    test_message = f"🎵 shazomi test notification sent at {datetime.now().strftime('%I:%M %p')}"
+    success = await send_notification(uid, test_message)
+
+    if success:
+        logger.info(f"Test notification sent successfully to {uid}")
+        return JSONResponse(
+            content={
+                "status": "success",
+                "uid": uid,
+                "message": test_message,
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+    else:
+        logger.error(f"Failed to send test notification to {uid}")
+        return JSONResponse(
+            content={
+                "status": "error",
+                "uid": uid,
+                "error": "Failed to send notification. Check OMI credentials."
+            },
+            status_code=500
+        )
 
 
 # Cleanup task to prevent memory leaks
