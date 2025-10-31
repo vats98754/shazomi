@@ -8,10 +8,12 @@ import os
 import logging
 import struct
 import asyncio
+import json
 import numpy as np
-from typing import Dict
+from typing import Dict, Any, Optional, Tuple
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
@@ -115,6 +117,145 @@ async def send_notification(uid: str, message: str) -> bool:
         return False
 
 
+def save_debug_data(
+    uid: str,
+    hashes: list,
+    matches: Optional[Dict[int, list]] = None,
+    song_id: Optional[int] = None,
+    score: Optional[int] = None,
+    info: Optional[Tuple[str, str, str]] = None,
+    audio_array: Optional[np.ndarray] = None
+) -> None:
+    """
+    Save intermediate debugging data to local directory
+
+    Args:
+        uid: User ID
+        hashes: Generated fingerprint hashes
+        matches: Matches from database
+        song_id: Best match song ID
+        score: Match score
+        info: Song info tuple (artist, album, title)
+        audio_array: Optional audio array data
+    """
+    try:
+        # Create debug directory
+        debug_dir = Path("debug_data")
+        debug_dir.mkdir(exist_ok=True)
+
+        # Create timestamped subdirectory for this request
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        request_dir = debug_dir / f"{uid}_{timestamp}"
+        request_dir.mkdir(exist_ok=True)
+
+        # Save hashes
+        hashes_file = request_dir / "hashes.json"
+        with open(hashes_file, 'w') as f:
+            # Convert hashes to serializable format
+            # hashes format: [(hash, time_offset, song_id), ...]
+            serializable_hashes = [
+                {"hash": str(h), "time_offset": float(t), "song_id": str(sid)}
+                for h, t, sid in hashes[:100]  # Save first 100 for brevity
+            ]
+            json.dump({
+                "count": len(hashes),
+                "hashes": serializable_hashes
+            }, f, indent=2)
+
+        # Save matches (if available)
+        if matches:
+            matches_file = request_dir / "matches.json"
+            with open(matches_file, 'w') as f:
+                # Convert matches to serializable format
+                serializable_matches = {
+                    str(s_id): [{"hash": int(h), "offset": int(o)} for h, o in match_list]
+                    for s_id, match_list in list(matches.items())[:10]  # First 10 songs
+                }
+                json.dump({
+                    "total_songs_matched": len(matches),
+                    "matches": serializable_matches
+                }, f, indent=2)
+
+        # Save best match info (if available)
+        result_file = request_dir / "result.json"
+        with open(result_file, 'w') as f:
+            last_id_time = last_identification.get(uid)
+            result_data = {
+                "last_identification": last_id_time.isoformat() if last_id_time else None
+            }
+            if song_id is not None:
+                result_data["song_id"] = int(song_id)
+            if score is not None:
+                result_data["score"] = int(score)
+            if info:
+                artist, album, title = info
+                result_data["song_info"] = {
+                    "title": title,
+                    "artist": artist,
+                    "album": album
+                }
+            json.dump(result_data, f, indent=2)
+
+        # Save audio stats if provided
+        if audio_array is not None:
+            audio_stats_file = request_dir / "audio_stats.json"
+            with open(audio_stats_file, 'w') as f:
+                json.dump({
+                    "duration_seconds": len(audio_array) / SAMPLE_RATE,
+                    "sample_count": len(audio_array),
+                    "sample_rate": SAMPLE_RATE,
+                    "min_value": int(audio_array.min()),
+                    "max_value": int(audio_array.max()),
+                    "mean_value": float(audio_array.mean()),
+                    "std_value": float(audio_array.std())
+                }, f, indent=2)
+
+            # Optionally save raw audio (can be large!)
+            # audio_file = request_dir / "audio.raw"
+            # audio_array.tofile(audio_file)
+
+        # Create summary text file
+        summary_file = request_dir / "summary.txt"
+        with open(summary_file, 'w') as f:
+            f.write(f"shazomi Debug Data\n")
+            f.write(f"=" * 50 + "\n\n")
+            f.write(f"User ID: {uid}\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Last Identification: {last_identification.get(uid)}\n\n")
+            f.write(f"Fingerprinting:\n")
+            f.write(f"  - Hashes generated: {len(hashes)}\n\n")
+
+            if matches is not None:
+                f.write(f"Database Matching:\n")
+                f.write(f"  - Songs matched: {len(matches)}\n")
+                if song_id is not None:
+                    f.write(f"  - Best match song ID: {song_id}\n")
+                if score is not None:
+                    f.write(f"  - Match score: {score}\n")
+                f.write("\n")
+            else:
+                f.write(f"Database Matching:\n")
+                f.write(f"  - No matches found in database\n\n")
+
+            if info:
+                artist, album, title = info
+                f.write(f"Song Info:\n")
+                f.write(f"  - Title: {title}\n")
+                f.write(f"  - Artist: {artist}\n")
+                f.write(f"  - Album: {album}\n")
+
+            if audio_array is not None:
+                f.write(f"\nAudio Stats:\n")
+                f.write(f"  - Duration: {len(audio_array) / SAMPLE_RATE:.2f}s\n")
+                f.write(f"  - Samples: {len(audio_array)}\n")
+                f.write(f"  - Sample rate: {SAMPLE_RATE} Hz\n")
+
+        logger.info(f"💾 Debug data saved to {request_dir}")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to save debug data: {e}", exc_info=True)
+
+
 async def process_audio_buffer(uid: str, sample_rate: int):
     """
     Process accumulated audio buffer for a user using fingerprinting
@@ -133,13 +274,13 @@ async def process_audio_buffer(uid: str, sample_rate: int):
         logger.info(f"User {uid}: Not enough audio yet ({duration:.1f}s)")
         return
 
-    # Check cooldown
-    if uid in last_identification:
-        time_since_last = datetime.now() - last_identification[uid]
-        if time_since_last.total_seconds() < COOLDOWN_SECONDS:
-            logger.info(f"User {uid}: In cooldown period")
-            audio_buffers[uid].clear()  # Clear buffer but don't process
-            return
+    # DROP THE FOLLOWING FOR NOW: # Check cooldown
+    # if uid in last_identification:
+    #     time_since_last = datetime.now() - last_identification[uid]
+    #     if time_since_last.total_seconds() < COOLDOWN_SECONDS:
+    #         logger.info(f"User {uid}: In cooldown period")
+    #         audio_buffers[uid].clear()  # Clear buffer but don't process
+    #         return
 
     logger.info(f"User {uid}: Processing {duration:.1f}s of audio")
 
@@ -297,6 +438,8 @@ async def audio_chunk_webhook(request: Request):
 
         if not matches:
             logger.info(f"❌ User {uid}: No matches found")
+            # Save debug data even when no matches
+            save_debug_data(uid, hashes, audio_array=audio_array)
             await send_notification(uid, "🎵 Hmm, I don't recognize this song. Make sure it's in your database!")
             return JSONResponse(content={"status": "ok", "message": "No matches found"})
 
@@ -305,11 +448,16 @@ async def audio_chunk_webhook(request: Request):
 
         if not song_id or score < MIN_MATCH_SCORE:
             logger.info(f"⚠️  User {uid}: Match score too low ({score})")
+            # Save debug data for low score cases
+            save_debug_data(uid, hashes, matches, song_id, score, audio_array=audio_array)
             await send_notification(uid, "🎵 I heard something, but couldn't match it confidently. Try again with clearer audio!")
             return JSONResponse(content={"status": "ok", "message": f"Score too low: {score}"})
 
         # Get song info
         info = get_info_for_song_id(song_id)
+
+        # Save debug data for testing
+        save_debug_data(uid, hashes, matches, song_id, score, info, audio_array)
 
         if info:
             artist, album, title = info
