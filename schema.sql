@@ -46,6 +46,34 @@ CREATE POLICY "Allow all operations on song_info"
     USING (true)
     WITH CHECK (true);
 
+-- Create listening_history table to track user song detections
+CREATE TABLE IF NOT EXISTS listening_history (
+    id BIGSERIAL PRIMARY KEY,
+    uid TEXT NOT NULL,
+    song_id TEXT NOT NULL,
+    artist TEXT,
+    album TEXT,
+    title TEXT,
+    match_score INTEGER NOT NULL,
+    detected_at TIMESTAMP DEFAULT NOW(),
+    FOREIGN KEY (song_id) REFERENCES song_info(song_id)
+);
+
+-- Create indexes for listening_history
+CREATE INDEX IF NOT EXISTS idx_listening_uid ON listening_history (uid);
+CREATE INDEX IF NOT EXISTS idx_listening_song_id ON listening_history (song_id);
+CREATE INDEX IF NOT EXISTS idx_listening_detected_at ON listening_history (detected_at);
+
+-- Enable RLS for listening_history
+ALTER TABLE listening_history ENABLE ROW LEVEL SECURITY;
+
+-- Create policy for listening_history
+CREATE POLICY "Allow all operations on listening_history"
+    ON listening_history
+    FOR ALL
+    USING (true)
+    WITH CHECK (true);
+
 -- Optional: Create a view for song statistics
 CREATE OR REPLACE VIEW song_stats AS
 SELECT
@@ -59,3 +87,14 @@ FROM song_info si
 LEFT JOIN fingerprint_hash h ON si.song_id = h.song_id
 GROUP BY si.song_id, si.artist, si.album, si.title, si.created_at
 ORDER BY fingerprint_count DESC;
+
+-- Optional: Create a view for user listening statistics
+CREATE OR REPLACE VIEW user_listening_stats AS
+SELECT
+    uid,
+    COUNT(*) as total_songs_detected,
+    COUNT(DISTINCT song_id) as unique_songs,
+    MAX(detected_at) as last_detection
+FROM listening_history
+GROUP BY uid
+ORDER BY total_songs_detected DESC;

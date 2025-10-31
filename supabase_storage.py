@@ -194,3 +194,67 @@ def get_info_for_song_id(song_id: str) -> Optional[Tuple[str, str, str]]:
     except Exception as e:
         logger.error(f"Error getting song info: {e}")
         return None
+
+
+def store_listening_history(uid: str, song_id: str, artist: str, album: str, title: str, match_score: int) -> bool:
+    """
+    Store a listening history record for a user.
+
+    Args:
+        uid: User ID
+        song_id: Song ID
+        artist: Artist name
+        album: Album name
+        title: Song title
+        match_score: Match confidence score
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        supabase = get_supabase()
+
+        history_data = {
+            "uid": uid,
+            "song_id": song_id,
+            "artist": artist,
+            "album": album,
+            "title": title,
+            "match_score": match_score
+        }
+
+        supabase.table("listening_history").insert(history_data).execute()
+        logger.info(f"Stored listening history: {uid} listened to {title}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error storing listening history: {e}")
+        return False
+
+
+def get_user_listening_history(uid: str, limit: int = 10) -> List[dict]:
+    """
+    Get recent listening history for a user.
+
+    Args:
+        uid: User ID
+        limit: Maximum number of records to return
+
+    Returns:
+        List of listening history records
+    """
+    try:
+        supabase = get_supabase()
+
+        result = supabase.table("listening_history")\
+            .select("*")\
+            .eq("uid", uid)\
+            .order("detected_at", desc=True)\
+            .limit(limit)\
+            .execute()
+
+        return result.data if result.data else []
+
+    except Exception as e:
+        logger.error(f"Error getting listening history: {e}")
+        return []

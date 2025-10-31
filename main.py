@@ -19,7 +19,7 @@ from logging.handlers import RotatingFileHandler
 
 # Import our fingerprinting modules
 from fingerprinting import fingerprint_audio, best_match
-from supabase_storage import get_matches, get_info_for_song_id
+from supabase_storage import get_matches, get_info_for_song_id, store_listening_history, get_user_listening_history
 
 # Configure persistent logging to file + console
 os.makedirs('logs', exist_ok=True)
@@ -73,6 +73,7 @@ identified_songs: Dict[str, set] = defaultdict(set)  # Track identified songs pe
 async def send_notification(uid: str, message: str) -> bool:
     """
     Send notification to Omi user using v2 API
+    Following official Omi API spec: https://docs.omi.me/doc/developer/apps/
 
     Args:
         uid: User's Omi ID
@@ -85,8 +86,12 @@ async def send_notification(uid: str, message: str) -> bool:
         logger.warning("OMI credentials not set, skipping notification")
         return False
 
-    # v2 API uses query parameters for uid and message
-    url = f"{OMI_NOTIFICATION_URL}?uid={uid}&message={message}"
+    # v2 API spec: POST /v2/integrations/{app_id}/notification
+    # Query params: uid and message
+    # Headers: Authorization, Content-Type, Content-Length
+    from urllib.parse import quote
+
+    url = f"{OMI_NOTIFICATION_URL}?uid={quote(uid)}&message={quote(message)}"
     headers = {
         "Authorization": f"Bearer {OMI_APP_SECRET}",
         "Content-Type": "application/json",
@@ -94,16 +99,19 @@ async def send_notification(uid: str, message: str) -> bool:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, headers=headers)
             response.raise_for_status()
-            logger.info(f"Notification sent to user {uid}")
+            logger.info(f"✅ Notification sent to user {uid}: {message[:50]}...")
             return True
     except httpx.HTTPStatusError as e:
-        logger.error(f"Notification API error: {e.response.status_code} - {e.response.text}")
+        logger.error(f"❌ Notification API error {e.response.status_code}: {e.response.text}")
+        return False
+    except httpx.TimeoutException:
+        logger.error(f"⏱️  Notification timeout for user {uid}")
         return False
     except Exception as e:
-        logger.error(f"Failed to send notification: {e}")
+        logger.error(f"❌ Failed to send notification: {e}")
         return False
 
 
@@ -177,22 +185,177 @@ async def process_audio_buffer(uid: str, sample_rate: int):
 
         # Check if we've already identified this song recently
         if song_key in identified_songs[uid]:
-            logger.info(f"User {uid}: Already identified {title}")
+            logger.info(f"User {uid}: Already identified {title} recently, skipping notification")
             return
 
         # Add to identified songs
         identified_songs[uid].add(song_key)
 
+        # Store listening history in database
+        logger.info(f"📝 Storing listening history for {uid}: {title} by {artist}")
+        store_success = store_listening_history(uid, song_id, artist, album, title, score)
+        if not store_success:
+            logger.warning(f"⚠️  Failed to store listening history for {uid}")
+
         # Format and send conversational notification
-        now = datetime.now()
         confidence = "🔥" if score >= 50 else "✨" if score >= 30 else "👍"
         message = f"🎵 That's \"{title}\" by {artist}! {confidence} (Match: {score})"
 
         await send_notification(uid, message)
-        logger.info(f"User {uid}: Identified {title} - {artist} (score: {score})")
+        logger.info(f"✅ User {uid}: Identified {title} - {artist} (score: {score})")
     else:
-        logger.warning(f"User {uid}: Song ID {song_id} not found in database")
+        logger.warning(f"❌ User {uid}: Song ID {song_id} not found in database")
         await send_notification(uid, "🎵 Found a match but couldn't retrieve song info. Database might need updating!")
+
+
+@app.post("/webhook/audio-chunk")
+async def audio_chunk_webhook(request: Request):
+    """
+    Webhook endpoint for Omi audio bites
+    Receives discrete 5s audio chunks from Omi via Railway webhook
+
+    Expected payload:
+    - uid: User ID
+    - audio_data: Base64 encoded audio bytes
+    - sample_rate: Audio sample rate (optional, defaults to 16000)
+
+    Or raw audio bytes with uid in query params
+    """
+    try:
+        # Try to get uid from query params first
+        uid = request.query_params.get("uid")
+        sample_rate = int(request.query_params.get("sample_rate", 16000))
+
+        # Try to parse JSON payload
+        try:
+            body = await request.json()
+            if not uid:
+                uid = body.get("uid")
+            sample_rate = body.get("sample_rate", sample_rate)
+
+            # Check if audio is base64 encoded
+            import base64
+            if "audio_data" in body:
+                audio_bytes = base64.b64decode(body["audio_data"])
+            else:
+                # Fall back to raw body
+                audio_bytes = await request.body()
+        except:
+            # If JSON parsing fails, treat as raw audio bytes
+            audio_bytes = await request.body()
+
+        if not uid:
+            logger.error("❌ Webhook received without uid")
+            return JSONResponse(
+                content={"error": "uid required"},
+                status_code=400
+            )
+
+        bytes_received = len(audio_bytes)
+
+        if bytes_received == 0:
+            logger.warning(f"⚠️  User {uid}: Empty audio chunk received")
+            return JSONResponse(content={"status": "ok", "message": "Empty audio"})
+
+        duration = bytes_received / (sample_rate * BYTES_PER_SAMPLE)
+        logger.info(f"🎤 User {uid}: Webhook received {bytes_received} bytes ({duration:.1f}s) at {sample_rate}Hz")
+
+        # Convert bytes to numpy array
+        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+
+        # Check if we have enough audio (at least 5 seconds)
+        if duration < MIN_AUDIO_DURATION:
+            logger.info(f"⚠️  User {uid}: Audio too short ({duration:.1f}s < {MIN_AUDIO_DURATION}s)")
+            return JSONResponse(
+                content={"status": "ok", "message": f"Audio too short: {duration:.1f}s"}
+            )
+
+        # Check cooldown
+        if uid in last_identification:
+            time_since_last = datetime.now() - last_identification[uid]
+            if time_since_last.total_seconds() < COOLDOWN_SECONDS:
+                logger.info(f"⏸️  User {uid}: In cooldown period ({time_since_last.total_seconds():.0f}s)")
+                return JSONResponse(
+                    content={"status": "ok", "message": "Cooldown active"}
+                )
+
+        # Update last identification time
+        last_identification[uid] = datetime.now()
+
+        # Generate fingerprint hashes
+        logger.info(f"🔍 User {uid}: Generating fingerprint...")
+        hashes = fingerprint_audio(audio_array)
+
+        if not hashes:
+            logger.warning(f"⚠️  User {uid}: No hashes generated")
+            await send_notification(uid, "🎵 Couldn't fingerprint that audio. Try again!")
+            return JSONResponse(content={"status": "error", "message": "No fingerprint generated"})
+
+        # Find matches in database
+        logger.info(f"🔎 User {uid}: Searching database with {len(hashes)} hashes...")
+        matches = get_matches(hashes)
+
+        if not matches:
+            logger.info(f"❌ User {uid}: No matches found")
+            await send_notification(uid, "🎵 Hmm, I don't recognize this song. Make sure it's in your database!")
+            return JSONResponse(content={"status": "ok", "message": "No matches found"})
+
+        # Get best match
+        song_id, score = best_match(matches)
+
+        if not song_id or score < MIN_MATCH_SCORE:
+            logger.info(f"⚠️  User {uid}: Match score too low ({score})")
+            await send_notification(uid, "🎵 I heard something, but couldn't match it confidently. Try again with clearer audio!")
+            return JSONResponse(content={"status": "ok", "message": f"Score too low: {score}"})
+
+        # Get song info
+        info = get_info_for_song_id(song_id)
+
+        if info:
+            artist, album, title = info
+            song_key = f"{title}:{artist}"
+
+            # Check if we've already identified this song recently
+            if song_key in identified_songs[uid]:
+                logger.info(f"🔁 User {uid}: Already identified {title} recently, skipping notification")
+                return JSONResponse(content={"status": "ok", "message": "Already identified recently"})
+
+            # Add to identified songs
+            identified_songs[uid].add(song_key)
+
+            # Store listening history in database
+            logger.info(f"📝 Storing listening history for {uid}: {title} by {artist}")
+            store_success = store_listening_history(uid, song_id, artist, album, title, score)
+            if not store_success:
+                logger.warning(f"⚠️  Failed to store listening history for {uid}")
+
+            # Format and send conversational notification
+            confidence = "🔥" if score >= 50 else "✨" if score >= 30 else "👍"
+            message = f"🎵 That's \"{title}\" by {artist}! {confidence} (Match: {score})"
+
+            await send_notification(uid, message)
+            logger.info(f"✅ User {uid}: Identified {title} - {artist} (score: {score})")
+
+            return JSONResponse(content={
+                "status": "success",
+                "song": {
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "score": score
+                }
+            })
+        else:
+            logger.warning(f"❌ User {uid}: Song ID {song_id} not found in database")
+            await send_notification(uid, "🎵 Found a match but couldn't retrieve song info. Database might need updating!")
+            return JSONResponse(content={"status": "error", "message": "Song info not found"})
+
+    except Exception as e:
+        logger.error(f"❌ Webhook error: {e}", exc_info=True)
+        return JSONResponse(
+            content={"error": str(e)},
+            status_code=500
+        )
 
 
 @app.post("/audio-stream")
@@ -260,9 +423,15 @@ async def health():
     return {
         "status": "healthy",
         "service": "shazomi",
-        "version": "3.0",
-        "mode": "audio_fingerprinting",
+        "version": "4.0",
+        "mode": "webhook + streaming",
         "active_users": len(audio_buffers),
+        "endpoints": {
+            "webhook": "/webhook/audio-chunk",
+            "streaming": "/audio-stream",
+            "test": "/test-notification",
+            "history": "/listening-history"
+        },
         "config": {
             "sample_rate": SAMPLE_RATE,
             "min_duration": MIN_AUDIO_DURATION,
@@ -297,6 +466,43 @@ async def stats(uid: str = Query(None, description="Optional user ID for user-sp
         "total_songs_identified": sum(len(songs) for songs in identified_songs.values()),
         "users_with_audio": [uid for uid, buf in audio_buffers.items() if len(buf) > 0]
     }
+
+
+@app.get("/listening-history")
+async def listening_history(
+    uid: str = Query(..., description="User ID"),
+    limit: int = Query(10, description="Number of records to return", ge=1, le=100)
+):
+    """
+    Get user's listening history from database
+
+    Args:
+        uid: User ID
+        limit: Maximum number of records (1-100, default 10)
+
+    Returns:
+        List of listening history records
+    """
+    try:
+        logger.info(f"📊 Fetching listening history for user {uid} (limit: {limit})")
+        history = get_user_listening_history(uid, limit)
+
+        return JSONResponse(
+            content={
+                "uid": uid,
+                "count": len(history),
+                "history": history
+            }
+        )
+    except Exception as e:
+        logger.error(f"❌ Error fetching listening history: {e}")
+        return JSONResponse(
+            content={
+                "error": "Failed to fetch listening history",
+                "details": str(e)
+            },
+            status_code=500
+        )
 
 
 @app.post("/test-notification")
@@ -365,11 +571,17 @@ async def startup_event():
         logger.warning("OMI credentials not set - notifications will not work")
 
     asyncio.create_task(cleanup_old_data())
-    logger.info("shazomi started - Real-time audio fingerprinting mode")
-    logger.info(f"Audio stream endpoint: /audio-stream")
-    logger.info(f"Setup check endpoint: /setup-completed")
-    logger.info(f"Algorithm: abracadabra (Shazam-based)")
-    logger.info(f"Database: Supabase PostgreSQL")
+    logger.info("🎵 shazomi v4.0 started - Webhook + Streaming mode")
+    logger.info("📍 Endpoints:")
+    logger.info("  - Webhook (Omi audio bites): POST /webhook/audio-chunk")
+    logger.info("  - Real-time streaming: POST /audio-stream")
+    logger.info("  - Listening history: GET /listening-history?uid=<uid>")
+    logger.info("  - Test notification: POST /test-notification?uid=<uid>")
+    logger.info("  - Setup check: GET /setup-completed?uid=<uid>")
+    logger.info("  - Health: GET /health")
+    logger.info(f"🔍 Algorithm: abracadabra (Shazam-based)")
+    logger.info(f"💾 Database: Supabase PostgreSQL")
+    logger.info(f"📝 Logs: logs/shazomi.log")
 
 
 if __name__ == "__main__":
