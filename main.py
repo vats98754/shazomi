@@ -506,29 +506,38 @@ async def audio_chunk_webhook(request: Request):
         )
 
 
-@app.post("/audio-stream")
-async def audio_stream(
+@app.post("/audio")
+async def audio_endpoint(
     request: Request,
     uid: str = Query(..., description="User ID"),
     sample_rate: int = Query(16000, description="Audio sample rate in Hz")
 ):
     """
-    Real-time audio streaming endpoint
-    Receives raw PCM audio bytes from Omi device
+    Omi Real-time Audio Streaming Endpoint (Following Official Omi Spec)
 
-    Args:
-        uid: User ID from query parameter
-        sample_rate: Audio sample rate (default 16000 Hz)
+    This endpoint receives raw PCM audio bytes (octet-stream) from Omi DevKit.
+
+    Query Parameters:
+        - uid: Unique user ID from Omi system
+        - sample_rate: Audio sample rate (16000 Hz for DevKit1 v1.0.4+ and DevKit2)
+
+    The audio bytes are accumulated until we have enough for fingerprinting,
+    then processed using Shazomi's recognition engine.
+
+    Configure in Omi App:
+        Settings > Developer Mode > Realtime audio bytes
+        Set endpoint to: https://your-railway-url.railway.app/audio
     """
     try:
-        # Read raw audio bytes
+        # Read raw audio bytes (octet-stream)
         audio_bytes = await request.body()
         bytes_received = len(audio_bytes)
 
         if bytes_received == 0:
             return PlainTextResponse("OK", status_code=200)
 
-        logger.info(f"User {uid}: Received {bytes_received} bytes at {sample_rate}Hz")
+        duration = bytes_received / (sample_rate * BYTES_PER_SAMPLE)
+        logger.info(f"🎤 User {uid}: Received {bytes_received} bytes ({duration:.1f}s) at {sample_rate}Hz")
 
         # Append to user's audio buffer
         audio_buffers[uid].extend(audio_bytes)
@@ -537,14 +546,28 @@ async def audio_stream(
         current_duration = len(audio_buffers[uid]) / (sample_rate * BYTES_PER_SAMPLE)
 
         if current_duration >= MAX_AUDIO_DURATION:
+            logger.info(f"📊 User {uid}: Buffer reached {current_duration:.1f}s, processing...")
             # Process in background to not block the response
             asyncio.create_task(process_audio_buffer(uid, sample_rate))
 
         return PlainTextResponse("OK", status_code=200)
 
     except Exception as e:
-        logger.error(f"Audio stream error: {e}", exc_info=True)
+        logger.error(f"❌ Audio endpoint error: {e}", exc_info=True)
         return PlainTextResponse("Error", status_code=500)
+
+
+@app.post("/audio-stream")
+async def audio_stream(
+    request: Request,
+    uid: str = Query(..., description="User ID"),
+    sample_rate: int = Query(16000, description="Audio sample rate in Hz")
+):
+    """
+    Alternative streaming endpoint (legacy support)
+    Same functionality as /audio but kept for backwards compatibility
+    """
+    return await audio_endpoint(request, uid, sample_rate)
 
 
 @app.get("/setup-completed")
@@ -719,16 +742,16 @@ async def startup_event():
         logger.warning("OMI credentials not set - notifications will not work")
 
     asyncio.create_task(cleanup_old_data())
-    logger.info("🎵 shazomi v4.0 started - Webhook + Streaming mode")
+    logger.info("🎵 shazomi v4.0 started - Omi Integration Ready")
     logger.info("📍 Endpoints:")
-    logger.info("  - Webhook (Omi audio bites): POST /webhook/audio-chunk")
-    logger.info("  - Real-time streaming: POST /audio-stream")
+    logger.info("  - Omi Audio Stream: POST /audio?uid=<uid>&sample_rate=16000")
+    logger.info("  - Webhook (audio bites): POST /webhook/audio-chunk")
     logger.info("  - Listening history: GET /listening-history?uid=<uid>")
     logger.info("  - Test notification: POST /test-notification?uid=<uid>")
     logger.info("  - Setup check: GET /setup-completed?uid=<uid>")
     logger.info("  - Health: GET /health")
-    logger.info(f"🔍 Algorithm: abracadabra (Shazam-based)")
-    logger.info(f"💾 Database: Supabase PostgreSQL")
+    logger.info(f"🔍 Algorithm: abracadabra (Shazam-based fingerprinting)")
+    logger.info(f"💾 Database: Supabase PostgreSQL ({473} songs loaded)")
     logger.info(f"📝 Logs: logs/shazomi.log")
 
 

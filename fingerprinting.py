@@ -20,6 +20,10 @@ TARGET_START = 0.05  # seconds
 TARGET_T = 1.8  # seconds
 TARGET_F = 4000  # Hz
 
+# Windowing settings for robust matching
+WINDOW_SIZE = 15.0  # seconds - size of each fingerprinting window
+WINDOW_OVERLAP = 5.0  # seconds - overlap between windows
+
 
 def my_spectrogram(audio):
     """Perform spectrogram calculation"""
@@ -116,35 +120,111 @@ def hash_points(points, identifier="recorded"):
     return hashes
 
 
-def fingerprint_audio(audio_data: np.ndarray):
+def fingerprint_audio_window(audio_data: np.ndarray, identifier: str, window_offset: float = 0.0):
     """
-    Generate fingerprint hashes from raw audio data
+    Fingerprint a single window of audio
 
     Args:
         audio_data: Raw PCM audio as numpy array (int16)
+        identifier: Unique identifier for the audio
+        window_offset: Time offset of this window in the original audio (seconds)
 
     Returns:
-        List of tuples: (hash, time_offset, song_id)
+        List of tuples: (hash, time_offset, song_id) with adjusted time offsets
     """
     try:
-        logger.info(f"Fingerprinting audio: {len(audio_data)} samples")
-
         # Generate spectrogram
         f, t, Sxx = my_spectrogram(audio_data)
-        logger.info(f"Spectrogram shape: {Sxx.shape}")
 
         # Find peaks
         peaks = find_peaks(Sxx)
-        logger.info(f"Found {len(peaks)} peaks")
 
         # Convert to time/frequency pairs
         peaks = idxs_to_tf_pairs(peaks, t, f)
 
         # Generate hashes
-        hashes = hash_points(peaks, "recorded")
-        logger.info(f"Generated {len(hashes)} hashes")
+        hashes = hash_points(peaks, identifier)
 
-        return hashes
+        # Adjust time offsets by window position
+        adjusted_hashes = []
+        for hash_val, time_offset, song_id in hashes:
+            adjusted_hashes.append((hash_val, time_offset + window_offset, song_id))
+
+        return adjusted_hashes
+
+    except Exception as e:
+        logger.error(f"Error fingerprinting audio window: {e}", exc_info=True)
+        return []
+
+
+def fingerprint_audio(audio_data: np.ndarray, identifier: str = "recorded", use_windowing: bool = None):
+    """
+    Generate fingerprint hashes from raw audio data
+
+    For long audio (>20s), automatically uses overlapping windows for robustness.
+    For short audio (<20s), fingerprints the entire clip at once.
+
+    Args:
+        audio_data: Raw PCM audio as numpy array (int16)
+        identifier: Unique identifier for the audio (file path for storage, "recorded" for recognition)
+        use_windowing: Force windowing on/off. If None, auto-detect based on length.
+
+    Returns:
+        List of tuples: (hash, time_offset, song_id)
+    """
+    try:
+        duration = len(audio_data) / SAMPLE_RATE
+        logger.info(f"Fingerprinting audio: {len(audio_data)} samples ({duration:.1f}s)")
+
+        # Auto-detect whether to use windowing
+        if use_windowing is None:
+            use_windowing = duration > 20.0
+
+        if not use_windowing:
+            # Short audio - fingerprint entire clip
+            logger.info("Using single-pass fingerprinting")
+
+            f, t, Sxx = my_spectrogram(audio_data)
+            logger.info(f"Spectrogram shape: {Sxx.shape}")
+
+            peaks = find_peaks(Sxx)
+            logger.info(f"Found {len(peaks)} peaks")
+
+            peaks = idxs_to_tf_pairs(peaks, t, f)
+            hashes = hash_points(peaks, identifier)
+            logger.info(f"Generated {len(hashes)} hashes")
+
+            return hashes
+
+        else:
+            # Long audio - use overlapping windows
+            logger.info(f"Using windowed fingerprinting (window={WINDOW_SIZE}s, overlap={WINDOW_OVERLAP}s)")
+
+            window_samples = int(WINDOW_SIZE * SAMPLE_RATE)
+            hop_samples = int((WINDOW_SIZE - WINDOW_OVERLAP) * SAMPLE_RATE)
+
+            all_hashes = []
+            window_count = 0
+
+            for start_sample in range(0, len(audio_data) - window_samples + 1, hop_samples):
+                end_sample = start_sample + window_samples
+                window = audio_data[start_sample:end_sample]
+                window_offset = start_sample / SAMPLE_RATE
+
+                window_hashes = fingerprint_audio_window(window, identifier, window_offset)
+                all_hashes.extend(window_hashes)
+                window_count += 1
+
+            # Handle last partial window if exists
+            if len(audio_data) % hop_samples != 0:
+                last_window = audio_data[-window_samples:]
+                last_offset = (len(audio_data) - window_samples) / SAMPLE_RATE
+                window_hashes = fingerprint_audio_window(last_window, identifier, last_offset)
+                all_hashes.extend(window_hashes)
+                window_count += 1
+
+            logger.info(f"Processed {window_count} windows, generated {len(all_hashes)} total hashes")
+            return all_hashes
 
     except Exception as e:
         logger.error(f"Error fingerprinting audio: {e}", exc_info=True)

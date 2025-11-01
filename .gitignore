@@ -45,6 +45,15 @@ logs/
 # Debug data
 debug_data/
 
+# Music library (audio files)
+music_library/
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.opus
+
 # Testing
 .pytest_cache/
 .coverage

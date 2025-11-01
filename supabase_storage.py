@@ -12,10 +12,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Supabase client
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
+# Supabase client (lazy loaded)
 _supabase_client: Optional[Client] = None
 
 
@@ -23,6 +20,10 @@ def get_supabase() -> Client:
     """Get or create Supabase client"""
     global _supabase_client
     if _supabase_client is None:
+        # Load env vars here to ensure they're fresh
+        SUPABASE_URL = os.getenv("SUPABASE_URL")
+        SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
         if not SUPABASE_URL or not SUPABASE_KEY:
             raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set")
         _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
