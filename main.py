@@ -72,7 +72,7 @@ last_identification: Dict[str, datetime] = {}
 identified_songs: Dict[str, set] = defaultdict(set)  # Track identified songs per user
 
 
-async def send_notification(uid: str, message: str) -> bool:
+async def send_notification(uid: str, message: str, debug: bool = False) -> bool:
     """
     Send notification to Omi user using v2 API
     Following official Omi API spec: https://docs.omi.me/doc/developer/apps/
@@ -80,12 +80,14 @@ async def send_notification(uid: str, message: str) -> bool:
     Args:
         uid: User's Omi ID
         message: Notification message text
+        debug: If True, log full request/response details
 
     Returns:
         True if notification sent successfully, False otherwise
     """
     if not OMI_APP_ID or not OMI_APP_SECRET:
-        logger.warning("OMI credentials not set, skipping notification")
+        logger.warning("⚠️  OMI credentials not set, skipping notification")
+        logger.warning("   Set OMI_APP_ID and OMI_APP_SECRET environment variables")
         return False
 
     # v2 API spec: POST /v2/integrations/{app_id}/notification
@@ -100,21 +102,70 @@ async def send_notification(uid: str, message: str) -> bool:
         "Content-Length": "0"
     }
 
+    if debug:
+        logger.info(f"🔍 DEBUG: Sending notification to Omi API")
+        logger.info(f"   URL: {url}")
+        logger.info(f"   Headers: Authorization=Bearer ***{OMI_APP_SECRET[-8:]}")
+        logger.info(f"   Message: {message}")
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, headers=headers)
+
+            if debug:
+                logger.info(f"🔍 DEBUG: Response status: {response.status_code}")
+                logger.info(f"   Response body: {response.text[:200]}")
+
             response.raise_for_status()
             logger.info(f"✅ Notification sent to user {uid}: {message[:50]}...")
             return True
+
     except httpx.HTTPStatusError as e:
-        logger.error(f"❌ Notification API error {e.response.status_code}: {e.response.text}")
+        logger.error(f"❌ Omi API error {e.response.status_code}: {e.response.text}")
+        logger.error(f"   URL: {url}")
+        logger.error(f"   Message: {message[:100]}")
         return False
     except httpx.TimeoutException:
         logger.error(f"⏱️  Notification timeout for user {uid}")
         return False
     except Exception as e:
-        logger.error(f"❌ Failed to send notification: {e}")
+        logger.error(f"❌ Failed to send notification: {e}", exc_info=True)
         return False
+
+
+def save_audio_file(uid: str, audio_array: np.ndarray, sample_rate: int = SAMPLE_RATE) -> Optional[Path]:
+    """
+    Save audio array as WAV file with proper headers
+
+    Args:
+        uid: User ID
+        audio_array: Audio data as numpy array (int16)
+        sample_rate: Sample rate in Hz
+
+    Returns:
+        Path to saved WAV file, or None if save failed
+    """
+    try:
+        from scipy.io import wavfile
+
+        # Create audio_files directory
+        audio_dir = Path("audio_files")
+        audio_dir.mkdir(exist_ok=True)
+
+        # Create timestamped filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{uid}_{timestamp}.wav"
+        filepath = audio_dir / filename
+
+        # Save as WAV file with proper headers
+        wavfile.write(filepath, sample_rate, audio_array)
+
+        logger.info(f"💾 Saved audio file: {filepath} ({len(audio_array)/sample_rate:.1f}s)")
+        return filepath
+
+    except Exception as e:
+        logger.error(f"❌ Failed to save audio file: {e}", exc_info=True)
+        return None
 
 
 def save_debug_data(
@@ -124,7 +175,8 @@ def save_debug_data(
     song_id: Optional[int] = None,
     score: Optional[int] = None,
     info: Optional[Tuple[str, str, str]] = None,
-    audio_array: Optional[np.ndarray] = None
+    audio_array: Optional[np.ndarray] = None,
+    audio_filepath: Optional[Path] = None
 ) -> None:
     """
     Save intermediate debugging data to local directory
@@ -137,6 +189,7 @@ def save_debug_data(
         score: Match score
         info: Song info tuple (artist, album, title)
         audio_array: Optional audio array data
+        audio_filepath: Optional path to saved audio file
     """
     try:
         # Create debug directory
@@ -200,7 +253,7 @@ def save_debug_data(
         if audio_array is not None:
             audio_stats_file = request_dir / "audio_stats.json"
             with open(audio_stats_file, 'w') as f:
-                json.dump({
+                audio_stats = {
                     "duration_seconds": len(audio_array) / SAMPLE_RATE,
                     "sample_count": len(audio_array),
                     "sample_rate": SAMPLE_RATE,
@@ -208,11 +261,10 @@ def save_debug_data(
                     "max_value": int(audio_array.max()),
                     "mean_value": float(audio_array.mean()),
                     "std_value": float(audio_array.std())
-                }, f, indent=2)
-
-            # Optionally save raw audio (can be large!)
-            # audio_file = request_dir / "audio.raw"
-            # audio_array.tofile(audio_file)
+                }
+                if audio_filepath:
+                    audio_stats["saved_audio_file"] = str(audio_filepath)
+                json.dump(audio_stats, f, indent=2)
 
         # Create summary text file
         summary_file = request_dir / "summary.txt"
@@ -221,7 +273,10 @@ def save_debug_data(
             f.write(f"=" * 50 + "\n\n")
             f.write(f"User ID: {uid}\n")
             f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Last Identification: {last_identification.get(uid)}\n\n")
+            f.write(f"Last Identification: {last_identification.get(uid)}\n")
+            if audio_filepath:
+                f.write(f"Audio File: {audio_filepath}\n")
+            f.write("\n")
             f.write(f"Fingerprinting:\n")
             f.write(f"  - Hashes generated: {len(hashes)}\n\n")
 
@@ -404,6 +459,11 @@ async def audio_chunk_webhook(request: Request):
         # Convert bytes to numpy array
         audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
 
+        # Save audio file for debugging
+        audio_filepath = save_audio_file(uid, audio_array, sample_rate)
+        if audio_filepath:
+            logger.info(f"📁 Audio saved: {audio_filepath}")
+
         # Check if we have enough audio (at least 5 seconds)
         if duration < MIN_AUDIO_DURATION:
             logger.info(f"⚠️  User {uid}: Audio too short ({duration:.1f}s < {MIN_AUDIO_DURATION}s)")
@@ -439,8 +499,8 @@ async def audio_chunk_webhook(request: Request):
         if not matches:
             logger.info(f"❌ User {uid}: No matches found")
             # Save debug data even when no matches
-            save_debug_data(uid, hashes, audio_array=audio_array)
-            await send_notification(uid, "🎵 Hmm, I don't recognize this song. Make sure it's in your database!")
+            save_debug_data(uid, hashes, audio_array=audio_array, audio_filepath=audio_filepath)
+            await send_notification(uid, "🎵 Hmm, I don't recognize this song. Make sure it's in your database!", debug=True)
             return JSONResponse(content={"status": "ok", "message": "No matches found"})
 
         # Get best match
@@ -449,15 +509,15 @@ async def audio_chunk_webhook(request: Request):
         if not song_id or score < MIN_MATCH_SCORE:
             logger.info(f"⚠️  User {uid}: Match score too low ({score})")
             # Save debug data for low score cases
-            save_debug_data(uid, hashes, matches, song_id, score, audio_array=audio_array)
-            await send_notification(uid, "🎵 I heard something, but couldn't match it confidently. Try again with clearer audio!")
+            save_debug_data(uid, hashes, matches, song_id, score, audio_array=audio_array, audio_filepath=audio_filepath)
+            await send_notification(uid, f"🎵 I heard something (score: {score}), but couldn't match it confidently. Try again with clearer audio!", debug=True)
             return JSONResponse(content={"status": "ok", "message": f"Score too low: {score}"})
 
         # Get song info
         info = get_info_for_song_id(song_id)
 
         # Save debug data for testing
-        save_debug_data(uid, hashes, matches, song_id, score, info, audio_array)
+        save_debug_data(uid, hashes, matches, song_id, score, info, audio_array, audio_filepath)
 
         if info:
             artist, album, title = info
@@ -477,11 +537,26 @@ async def audio_chunk_webhook(request: Request):
             if not store_success:
                 logger.warning(f"⚠️  Failed to store listening history for {uid}")
 
-            # Format and send conversational notification
-            confidence = "🔥" if score >= 50 else "✨" if score >= 30 else "👍"
-            message = f"🎵 That's \"{title}\" by {artist}! {confidence} (Match: {score})"
+            # Format and send conversational notification with match details
+            if score >= 100:
+                confidence = "🔥"
+                confidence_text = "Perfect match!"
+            elif score >= 50:
+                confidence = "🔥"
+                confidence_text = "Very confident!"
+            elif score >= 30:
+                confidence = "✨"
+                confidence_text = "Pretty confident!"
+            else:
+                confidence = "👍"
+                confidence_text = "Match found!"
 
-            await send_notification(uid, message)
+            message = f"🎵 That's \"{title}\" by {artist}! {confidence} {confidence_text} (Score: {score})"
+
+            # Enable debug mode for first few identifications per user
+            debug_mode = len(identified_songs.get(uid, set())) < 3
+
+            await send_notification(uid, message, debug=debug_mode)
             logger.info(f"✅ User {uid}: Identified {title} - {artist} (score: {score})")
 
             return JSONResponse(content={
